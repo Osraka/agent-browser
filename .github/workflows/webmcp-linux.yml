@@ -1,0 +1,112 @@
+name: WebMCP Chrome 157 reproduction
+on:
+  push:
+    branches: [diagnostics/webmcp-chrome-157-2513]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CHROME_VERSION: 157.0.8103.38
+      UPSTREAM_SHA: e7519957b9067c541825afa21a792fbe1f483047
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download pinned Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/webmcp-2513"
+          mkdir -p "$root/profiles" "$root/home"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --retry 2 --max-time 180 \
+            "https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chrome-linux64.zip" \
+            --dump-header "$root/headers" --output "$root/chrome.zip"
+          expected="$(tr -d '\r' < "$root/headers" | sed -nE 's/^[Xx]-[Gg]oog-[Hh]ash:.*md5=([^, ]+).*/\1/p' | tail -1)"
+          actual="$(openssl dgst -md5 -binary "$root/chrome.zip" | openssl base64 -A)"
+          test -n "$expected"
+          test "$actual" = "$expected"
+          unzip -q "$root/chrome.zip" -d "$root"
+          rm "$root/chrome.zip"
+          "$root/chrome-linux64/chrome" --version
+      - name: Compare the WebMCP launch flags without Agent Browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/webmcp-2513"
+          env -i HOME="$root/home" TMPDIR="$root" PATH="$PATH" GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            node probe.mjs "$root/chrome-linux64/chrome" "$root/profiles" github-linux | tee "$root/matrix.jsonl"
+          node --input-type=module - "$root/matrix.jsonl" "$CHROME_VERSION" <<'JS'
+          import assert from "node:assert/strict";
+          import { readFileSync } from "node:fs";
+          const [file, version] = process.argv.slice(2);
+          const rows = new Map(readFileSync(file, "utf8").trim().split("\n").map(line => {
+            const row = JSON.parse(line);
+            return [row.name, row];
+          }));
+          assert.equal(rows.size, 4);
+          for (const [name, enabled] of Object.entries({
+            control: false, "agent-browser": false, "add-webmcp": true, "webmcp-only": true,
+          })) {
+            const row = rows.get(name);
+            assert.ok(row && !row.error, `Incomplete browser case: ${name}`);
+            assert.ok(row.browser?.endsWith(version), `Wrong browser version for ${name}`);
+            assert.equal(row.fixture.secure, true, name);
+            assert.equal(row.fixture.registered, enabled, name);
+            assert.equal(row.fixture.document, enabled ? "object" : "undefined", name);
+            if (enabled) {
+              assert.equal(row.domain, "available", name);
+              assert.ok(row.events.includes("WebMCP.toolsAdded"), `No toolsAdded event for ${name}`);
+            }
+          }
+          console.log("Browser matrix matched all four expected outcomes.");
+          JS
+      - name: Compare the upstream discovery and opt-out tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/webmcp-2513"
+          git init -q "$root/upstream"
+          git -C "$root/upstream" fetch -q --depth=1 \
+            https://github.com/vercel-labs/agent-browser.git "$UPSTREAM_SHA"
+          git -C "$root/upstream" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$root/upstream" rev-parse HEAD)" = "$UPSTREAM_SHA"
+          cd "$root/upstream"
+          rustc --version
+          export AGENT_BROWSER_EXECUTABLE_PATH="$root/chrome-linux64/chrome"
+          export AGENT_BROWSER_SOCKET_DIR="$root/sockets"
+          export TMPDIR="$root"
+          mkdir -p "$AGENT_BROWSER_SOCKET_DIR"
+          run_test() {
+            local test_name="$1" logfile="$2"
+            cargo test --locked --profile ci --manifest-path cli/Cargo.toml \
+              "native::e2e_tests::$test_name" -- --ignored --exact --test-threads=1 2>&1 | tee "$logfile"
+          }
+          discovery=e2e_webmcp_discovery_invocation_and_cancellation
+          opt_out=e2e_webmcp_opt_out_returns_no_tools
+          if run_test "$discovery" "$root/before.log"; then
+            echo "Baseline discovery did not fail as expected."
+            exit 1
+          fi
+          grep -q 'test result: FAILED. 0 passed; 1 failed' "$root/before.log"
+          grep -q "test native::e2e_tests::$discovery .* FAILED" "$root/before.log"
+          grep -q 'left: Null' "$root/before.log"
+          run_test "$opt_out" "$root/opt-out-before.log"
+          grep -q 'test result: ok. 1 passed; 0 failed' "$root/opt-out-before.log"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("cli/src/native/cdp/chrome.rs")
+          s = p.read_text()
+          marker = '        enable_features.push("WebMCPTesting".to_string());\n'
+          assert s.count(marker) == 1, "upstream launch branch changed"
+          p.write_text(s.replace(marker, marker + '        enable_features.push("WebMCP".to_string());\n'))
+          PY
+          git diff --check
+          run_test "$discovery" "$root/after.log"
+          grep -q 'test result: ok. 1 passed; 0 failed' "$root/after.log"
+          run_test "$opt_out" "$root/opt-out-after.log"
+          grep -q 'test result: ok. 1 passed; 0 failed' "$root/opt-out-after.log"
